@@ -130,13 +130,15 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
 
     def __cinit__(self, Splitter splitter, intp_t min_samples_split,
                   intp_t min_samples_leaf, float64_t min_weight_leaf,
-                  intp_t max_depth, float64_t min_impurity_decrease):
+                  intp_t max_depth, float64_t min_impurity_decrease, bint two_pixel=False):
         self.splitter = splitter
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_leaf = min_weight_leaf
         self.max_depth = max_depth
         self.min_impurity_decrease = min_impurity_decrease
+
+        self.two_pixel = two_pixel
 
     cpdef build(
         self,
@@ -253,7 +255,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
                                (split.improvement + EPSILON <
                                 min_impurity_decrease))
 
-                node_id = tree._add_node(parent, is_left, is_leaf, split.feature,
+                node_id = tree._add_node(parent, is_left, is_leaf, split.feature, split.feature2,
                                          split.threshold, parent_record.impurity,
                                          n_node_samples, weighted_n_node_samples,
                                          split.missing_go_to_left)
@@ -384,7 +386,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
     def __cinit__(self, Splitter splitter, intp_t min_samples_split,
                   intp_t min_samples_leaf,  min_weight_leaf,
                   intp_t max_depth, intp_t max_leaf_nodes,
-                  float64_t min_impurity_decrease):
+                  float64_t min_impurity_decrease, bint two_pixel=False):
         self.splitter = splitter
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
@@ -392,6 +394,8 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
         self.max_depth = max_depth
         self.max_leaf_nodes = max_leaf_nodes
         self.min_impurity_decrease = min_impurity_decrease
+
+        self.two_pixel = two_pixel
 
     cpdef build(
         self,
@@ -612,7 +616,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
                                  if parent != NULL
                                  else _TREE_UNDEFINED,
                                  is_left, is_leaf,
-                                 split.feature, split.threshold, parent_record.impurity,
+                                 split.feature, split.feature2,  split.threshold, parent_record.impurity,
                                  n_node_samples, weighted_n_node_samples,
                                  split.missing_go_to_left)
         if node_id == INTPTR_MAX:
@@ -768,7 +772,7 @@ cdef class Tree:
 
     # TODO: Convert n_classes to cython.integral memory view once
     #  https://github.com/cython/cython/issues/5243 is fixed
-    def __cinit__(self, intp_t n_features, cnp.ndarray n_classes, intp_t n_outputs):
+    def __cinit__(self, intp_t n_features, cnp.ndarray n_classes, intp_t n_outputs, bint two_pixel=False):
         """Constructor."""
         cdef intp_t dummy = 0
         size_t_dtype = np.array(dummy).dtype
@@ -794,6 +798,9 @@ cdef class Tree:
         self.capacity = 0
         self.value = NULL
         self.nodes = NULL
+
+        #Two Pixel 
+        self.two_pixel = two_pixel
 
     def __dealloc__(self):
         """Destructor."""
@@ -895,7 +902,7 @@ cdef class Tree:
         return 0
 
     cdef intp_t _add_node(self, intp_t parent, bint is_left, bint is_leaf,
-                          intp_t feature, float64_t threshold, float64_t impurity,
+                          intp_t feature, intp_t feature2, float64_t threshold, float64_t impurity,
                           intp_t n_node_samples,
                           float64_t weighted_n_node_samples,
                           uint8_t missing_go_to_left) except -1 nogil:
@@ -926,11 +933,13 @@ cdef class Tree:
             node.left_child = _TREE_LEAF
             node.right_child = _TREE_LEAF
             node.feature = _TREE_UNDEFINED
+            node.feature2 = _TREE_UNDEFINED
             node.threshold = _TREE_UNDEFINED
 
         else:
             # left_child and right_child will be set later
             node.feature = feature
+            node.feature2 = feature2
             node.threshold = threshold
             node.missing_go_to_left = missing_go_to_left
 
@@ -967,7 +976,10 @@ cdef class Tree:
         # Extract input
         cdef const float32_t[:, :] X_ndarray = X
         cdef intp_t n_samples = X.shape[0]
-        cdef float32_t X_i_node_feature
+        cdef float32_t X_i_node_feature 
+        cdef float32_t X_i_node_feature2
+        cdef bint twoPixel = self.twoPixel
+
 
         # Initialize output
         cdef intp_t[:] out = np.zeros(n_samples, dtype=np.intp)
@@ -982,16 +994,23 @@ cdef class Tree:
                 # While node not a leaf
                 while node.left_child != _TREE_LEAF:
                     X_i_node_feature = X_ndarray[i, node.feature]
+                    X_i_node_feature2 = 0 if not twoPixel else X_ndarray[i, node.feature2]
                     # ... and node.right_child != _TREE_LEAF:
                     if isnan(X_i_node_feature):
                         if node.missing_go_to_left:
                             node = &self.nodes[node.left_child]
                         else:
                             node = &self.nodes[node.right_child]
-                    elif X_i_node_feature <= node.threshold:
-                        node = &self.nodes[node.left_child]
+                    elif (twoPixel):
+                        if X_i_node_feature - X_i_node_feature2 <= node.threshold:
+                            node = &self.nodes[node.left_child]
+                        else:
+                            node = &self.nodes[node.right_child]
                     else:
-                        node = &self.nodes[node.right_child]
+                        if X_i_node_feature <= node.threshold:
+                            node = &self.nodes[node.left_child]
+                        else:
+                            node = &self.nodes[node.right_child]
 
                 out[i] = <intp_t>(node - self.nodes)  # node offset
 
@@ -1936,7 +1955,7 @@ cdef void _build_pruned_tree(
                 break
 
             new_node_id = tree._add_node(
-                parent, is_left, is_leaf, node.feature, node.threshold,
+                parent, is_left, is_leaf, node.feature,node.feature2, node.threshold,
                 node.impurity, node.n_node_samples,
                 node.weighted_n_node_samples, node.missing_go_to_left)
 

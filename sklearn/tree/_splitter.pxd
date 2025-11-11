@@ -13,6 +13,7 @@ from sklearn.tree._tree cimport ParentInfo
 cdef struct SplitRecord:
     # Data to track sample split
     intp_t feature         # Which feature to split on.
+    intp_t feature2         # Second feature that might be needed in two pixel test.
     intp_t pos             # Split samples array at the given position,
     #                      # i.e. count of samples below threshold for feature.
     #                      # pos is >= end if the node is a leaf.

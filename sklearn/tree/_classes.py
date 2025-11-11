@@ -79,7 +79,9 @@ CRITERIA_REG = {
     "poisson": _criterion.Poisson,
 }
 
-DENSE_SPLITTERS = {"best": _splitter.BestSplitter, "random": _splitter.RandomSplitter}
+DENSE_SPLITTERS = {"best": _splitter.BestSplitter, "random": _splitter.RandomSplitter,
+                   "twoPixel": _splitter.TwoPixelSplitter
+                   }
 
 SPARSE_SPLITTERS = {
     "best": _splitter.BestSparseSplitter,
@@ -103,7 +105,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
     __metadata_request__predict = {"check_input": metadata_routing.UNUSED}
 
     _parameter_constraints: dict = {
-        "splitter": [StrOptions({"best", "random"})],
+        "splitter": [StrOptions({"best", "random", "twoPixel"})],
         "max_depth": [Interval(Integral, 1, None, closed="left"), None],
         "min_samples_split": [
             Interval(Integral, 2, None, closed="left"),
@@ -145,6 +147,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
         ccp_alpha=0.0,
         monotonic_cst=None,
     ):
+        self.twoPixel = True if splitter == 'twoPixel' else False
         self.criterion = criterion
         self.splitter = splitter
         self.max_depth = max_depth
@@ -442,13 +445,14 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
             )
 
         if is_classifier(self):
-            self.tree_ = Tree(self.n_features_in_, self.n_classes_, self.n_outputs_)
+            self.tree_ = Tree(self.n_features_in_, self.n_classes_, self.n_outputs_, self.twoPixel)
         else:
             self.tree_ = Tree(
                 self.n_features_in_,
                 # TODO: tree shouldn't need this in this case
                 np.array([1] * self.n_outputs_, dtype=np.intp),
                 self.n_outputs_,
+                self.twoPixel
             )
 
         # Use BestFirst if max_leaf_nodes given; use DepthFirst otherwise
@@ -460,6 +464,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 min_weight_leaf,
                 max_depth,
                 self.min_impurity_decrease,
+                self.twoPixel
             )
         else:
             builder = BestFirstTreeBuilder(
@@ -470,6 +475,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                 max_depth,
                 max_leaf_nodes,
                 self.min_impurity_decrease,
+                self.twoPixel
             )
 
         builder.build(self.tree_, X, y, sample_weight, missing_values_in_feature_mask)
@@ -620,13 +626,14 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
         # build pruned tree
         if is_classifier(self):
             n_classes = np.atleast_1d(self.n_classes_)
-            pruned_tree = Tree(self.n_features_in_, n_classes, self.n_outputs_)
+            pruned_tree = Tree(self.n_features_in_, n_classes, self.n_outputs_, self.twoPixel)
         else:
             pruned_tree = Tree(
                 self.n_features_in_,
                 # TODO: the tree shouldn't need this param
                 np.array([1] * self.n_outputs_, dtype=np.intp),
                 self.n_outputs_,
+                self.twoPixel
             )
         _build_pruned_tree_ccp(pruned_tree, self.tree_, self.ccp_alpha)
 

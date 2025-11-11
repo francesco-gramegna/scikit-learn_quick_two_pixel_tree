@@ -17,6 +17,7 @@ cdef struct Node:
     intp_t left_child                    # id of the left child of the node
     intp_t right_child                   # id of the right child of the node
     intp_t feature                       # Feature used for splitting the node
+    intp_t feature2                       # 2nd Feature used for splitting the node if two pixel
     float64_t threshold                  # Threshold value at the node
     float64_t impurity                   # Impurity of the node (i.e., the value of the criterion)
     intp_t n_node_samples                # Number of samples at the node
@@ -53,9 +54,11 @@ cdef class Tree:
     cdef float64_t* value                # (capacity, n_outputs, max_n_classes) array of values
     cdef intp_t value_stride             # = n_outputs * max_n_classes
 
+    cdef public bint two_pixel         # Tells wheter the tree uses axis aligned vs two pixel test
+
     # Methods
     cdef intp_t _add_node(self, intp_t parent, bint is_left, bint is_leaf,
-                          intp_t feature, float64_t threshold, float64_t impurity,
+                          intp_t feature,intp_t feature2, float64_t threshold, float64_t impurity,
                           intp_t n_node_samples,
                           float64_t weighted_n_node_samples,
                           uint8_t missing_go_to_left) except -1 nogil
@@ -97,6 +100,7 @@ cdef class TreeBuilder:
     cdef intp_t min_samples_leaf        # Minimum number of samples in a leaf
     cdef float64_t min_weight_leaf         # Minimum weight in a leaf
     cdef intp_t max_depth               # Maximal tree depth
+    cdef bint two_pixel                 #wheter the tree will use the two pixel test or axis aligned
     cdef float64_t min_impurity_decrease   # Impurity threshold for early stopping
 
     cpdef build(

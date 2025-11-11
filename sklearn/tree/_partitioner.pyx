@@ -1,4 +1,4 @@
-"""Partition samples in the construction of a tree.
+"""Part==ion samples in the construction of a tree.
 
 This module contains the algorithms for moving sample indices to
 the left and right child node given a split determined by the
@@ -11,6 +11,7 @@ and sparse data stored in a Compressed Sparse Column (CSC) format.
 # SPDX-License-Identifier: BSD-3-Clause
 
 from cython cimport final
+from libc.stdio cimport printf
 from libc.math cimport isnan, log2
 from libc.stdlib cimport qsort
 from libc.string cimport memcpy
@@ -51,8 +52,124 @@ cdef class DensePartitioner:
         self.end = end
         self.n_missing = 0
 
+    cdef inline void sort_samples_and_feature_values_two_pixel(
+        self, intp_t current_feature1, intp_t current_feature2
+    ) noexcept nogil:
+        """Simultaneously sort based on the feature_values.
+
+        Missing values are stored at the end of feature_values.
+        The number of missing values observed in feature_values is stored
+        in self.n_missing.
+        """
+        cdef:
+            intp_t i, current_end
+            float32_t[::1] feature_values = self.feature_values
+            const float32_t[:, :] X = self.X
+            intp_t[::1] samples = self.samples
+            intp_t n_missing = 0
+            const uint8_t[::1] missing_values_in_feature_mask = self.missing_values_in_feature_mask
+        
+
+
+        # Sort samples along that feature; by copying the values into an array and
+        # sorting the array in a manner which utilizes the cache more effectively.
+        if missing_values_in_feature_mask is not None and missing_values_in_feature_mask[current_feature1]:
+            printf("MISSING VALUES : NOT GOOD\n")
+
+            i, current_end = self.start, self.end - 1
+            #here we do not care for missing value for feature 2 since we will not have missing values ... TODO
+            # Missing values are placed at the end and do not participate in the sorting.
+            while i <= current_end:
+                # Finds the right-most value that is not missing so that
+                # it can be swapped with missing values at its left.
+                if isnan(X[samples[current_end], current_feature1]):
+                    n_missing += 1
+                    current_end -= 1
+                    continue
+
+                # X[samples[current_end], current_feature] is a non-missing value
+                if isnan(X[samples[i], current_feature1]):
+                    samples[i], samples[current_end] = samples[current_end], samples[i]
+                    n_missing += 1
+                    current_end -= 1
+
+                feature_values[i] = X[samples[i], current_feature1] - X[samples[i], current_feature2]
+                i += 1
+        else:
+            # When there are no missing values, we only need to copy the data into
+            # feature_values
+            for i in range(self.start, self.end):
+                feature_values[i] = X[samples[i], current_feature1] - X[samples[i], current_feature2]
+
+        sort(&feature_values[self.start], &samples[self.start], self.end - self.start - n_missing)
+        self.n_missing = n_missing
+
+
+    
+    cdef inline void partition_samples_final_two_pixel(
+        self,
+        intp_t best_pos,
+        float64_t best_threshold,
+        intp_t best_feature1,
+        intp_t best_feature2,
+        intp_t best_n_missing,
+    ) noexcept nogil:
+        """Partition samples for X at the best_threshold and best_feature.
+
+        If missing values are present, this method partitions `samples`
+        so that the `best_n_missing` missing values' indices are in the
+        right-most end of `samples`, that is `samples[end_non_missing:end]`.
+        """
+        cdef:
+            # Local invariance: start <= p <= partition_end <= end
+            intp_t start = self.start
+            intp_t p = start
+            intp_t end = self.end - 1
+            intp_t partition_end = end - best_n_missing
+            intp_t[::1] samples = self.samples
+            const float32_t[:, :] X = self.X
+            float32_t current_value
+
+        if best_n_missing != 0:
+            # Move samples with missing values to the end while partitioning the
+            # non-missing samples
+            while p <= partition_end:
+                # Keep samples with missing values at the end
+                if isnan(X[samples[end], best_feature1]):
+                    end -= 1
+                    continue
+
+                # Swap sample with missing values with the sample at the end
+                current_value = X[samples[p], best_feature1]
+                if isnan(current_value):
+                    samples[p], samples[end] = samples[end], samples[p]
+                    end -= 1
+
+                    # The swapped sample at the end is always a non-missing value, so
+                    # we can continue the algorithm without checking for missingness.
+                    current_value = X[samples[p], best_feature1] - X[samples[p], best_feature2]
+
+
+                # Partition the non-missing samples
+                if current_value <= best_threshold:
+                    p += 1
+                else:
+                    samples[p], samples[partition_end] = samples[partition_end], samples[p]
+                    partition_end -= 1
+        else:
+            # Partitioning routine when there are no missing values
+            while p < partition_end:
+                if X[samples[p], best_feature1]  - X[samples[p], best_feature2] <= best_threshold:
+                    p += 1
+                else:
+                    samples[p], samples[partition_end] = samples[partition_end], samples[p]
+                    partition_end -= 1
+
+
+
+
     cdef inline void sort_samples_and_feature_values(
-        self, intp_t current_feature
+        self, intp_t current_feature 
     ) noexcept nogil:
         """Simultaneously sort based on the feature_values.
 
@@ -93,7 +210,7 @@ cdef class DensePartitioner:
             # When there are no missing values, we only need to copy the data into
             # feature_values
             for i in range(self.start, self.end):
-                feature_values[i] = X[samples[i], current_feature]
+                feature_values[i] = X[samples[i], current_feature] 
 
         sort(&feature_values[self.start], &samples[self.start], self.end - self.start - n_missing)
         self.n_missing = n_missing

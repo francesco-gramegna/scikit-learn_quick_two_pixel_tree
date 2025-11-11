@@ -78,6 +78,9 @@ cdef class DensePartitioner:
     cdef void sort_samples_and_feature_values(
         self, intp_t current_feature
     ) noexcept nogil
+    cdef void sort_samples_and_feature_values_two_pixel(
+        self, intp_t current_feature1, intp_t current_feature2
+    ) noexcept nogil
     cdef void init_node_split(
         self,
         intp_t start,
@@ -105,6 +108,16 @@ cdef class DensePartitioner:
         intp_t best_feature,
         intp_t n_missing,
     ) noexcept nogil
+    cdef void partition_samples_final_two_pixel(
+        self,
+        intp_t best_pos,
+        float64_t best_threshold,
+        intp_t best_feature1,
+        intp_t best_feature,
+        intp_t n_missing,
+    ) noexcept nogil
+
+
 
 
 cdef class SparsePartitioner:
@@ -159,6 +172,7 @@ cdef class SparsePartitioner:
         intp_t best_feature,
         intp_t n_missing,
     ) noexcept nogil
+    
 
     cdef void extract_nnz(
         self,

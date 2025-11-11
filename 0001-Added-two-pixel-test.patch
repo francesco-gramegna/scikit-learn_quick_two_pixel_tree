@@ -1,0 +1,739 @@
+From b1340012e178ed3f8bcc12f35442e877cd81e911 Mon Sep 17 00:00:00 2001
+From: Francesco Gramegna <francesco.gramegna.fg@gmail.com>
+Date: Tue, 11 Nov 2025 19:35:00 +0900
+Subject: [PATCH] Added two pixel test
+
+---
+ sklearn/tree/_classes.py      |  15 +-
+ sklearn/tree/_partitioner.pxd |   3 +
+ sklearn/tree/_partitioner.pyx |  57 +++++-
+ sklearn/tree/_splitter.pxd    |   1 +
+ sklearn/tree/_splitter.pyx    | 325 ++++++++++++++++++++++++++++++++++
+ sklearn/tree/_tree.pxd        |   6 +-
+ sklearn/tree/_tree.pyx        |  41 +++--
+ 7 files changed, 429 insertions(+), 19 deletions(-)
+
+diff --git a/sklearn/tree/_classes.py b/sklearn/tree/_classes.py
+index 8536ccf..720d8b8 100644
+--- a/sklearn/tree/_classes.py
++++ b/sklearn/tree/_classes.py
+@@ -76,7 +76,9 @@ CRITERIA_REG = {
+     "poisson": _criterion.Poisson,
+ }
+ 
+-DENSE_SPLITTERS = {"best": _splitter.BestSplitter, "random": _splitter.RandomSplitter}
++DENSE_SPLITTERS = {"best": _splitter.BestSplitter, "random": _splitter.RandomSplitter,
++                   "twoPixel": _splitter.TwoPixelSplitter
++                   }
+ 
+ SPARSE_SPLITTERS = {
+     "best": _splitter.BestSparseSplitter,
+@@ -100,7 +102,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+     __metadata_request__predict = {"check_input": metadata_routing.UNUSED}
+ 
+     _parameter_constraints: dict = {
+-        "splitter": [StrOptions({"best", "random"})],
++        "splitter": [StrOptions({"best", "random", "twoPixel"})],
+         "max_depth": [Interval(Integral, 1, None, closed="left"), None],
+         "min_samples_split": [
+             Interval(Integral, 2, None, closed="left"),
+@@ -142,6 +144,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+         ccp_alpha=0.0,
+         monotonic_cst=None,
+     ):
++        self.twoPixel = True if splitter == 'twoPixel' else False
+         self.criterion = criterion
+         self.splitter = splitter
+         self.max_depth = max_depth
+@@ -439,13 +442,14 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+             )
+ 
+         if is_classifier(self):
+-            self.tree_ = Tree(self.n_features_in_, self.n_classes_, self.n_outputs_)
++            self.tree_ = Tree(self.n_features_in_, self.n_classes_, self.n_outputs_, self.twoPixel)
+         else:
+             self.tree_ = Tree(
+                 self.n_features_in_,
+                 # TODO: tree shouldn't need this in this case
+                 np.array([1] * self.n_outputs_, dtype=np.intp),
+                 self.n_outputs_,
++                self.twoPixel
+             )
+ 
+         # Use BestFirst if max_leaf_nodes given; use DepthFirst otherwise
+@@ -457,6 +461,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+                 min_weight_leaf,
+                 max_depth,
+                 self.min_impurity_decrease,
++                self.twoPixel
+             )
+         else:
+             builder = BestFirstTreeBuilder(
+@@ -467,6 +472,7 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+                 max_depth,
+                 max_leaf_nodes,
+                 self.min_impurity_decrease,
++                self.twoPixel
+             )
+ 
+         builder.build(self.tree_, X, y, sample_weight, missing_values_in_feature_mask)
+@@ -617,13 +623,14 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+         # build pruned tree
+         if is_classifier(self):
+             n_classes = np.atleast_1d(self.n_classes_)
+-            pruned_tree = Tree(self.n_features_in_, n_classes, self.n_outputs_)
++            pruned_tree = Tree(self.n_features_in_, n_classes, self.n_outputs_, self.twoPixel)
+         else:
+             pruned_tree = Tree(
+                 self.n_features_in_,
+                 # TODO: the tree shouldn't need this param
+                 np.array([1] * self.n_outputs_, dtype=np.intp),
+                 self.n_outputs_,
++                self.twoPixel
+             )
+         _build_pruned_tree_ccp(pruned_tree, self.tree_, self.ccp_alpha)
+ 
+diff --git a/sklearn/tree/_partitioner.pxd b/sklearn/tree/_partitioner.pxd
+index fd41dec..d2fbc30 100644
+--- a/sklearn/tree/_partitioner.pxd
++++ b/sklearn/tree/_partitioner.pxd
+@@ -78,6 +78,9 @@ cdef class DensePartitioner:
+     cdef void sort_samples_and_feature_values(
+         self, intp_t current_feature
+     ) noexcept nogil
++    cdef void sort_samples_and_feature_values_two_pixel(
++        self, intp_t current_feature1, intp_t current_feature2
++    ) noexcept nogil
+     cdef void init_node_split(
+         self,
+         intp_t start,
+diff --git a/sklearn/tree/_partitioner.pyx b/sklearn/tree/_partitioner.pyx
+index 7c342ed..d01dac2 100644
+--- a/sklearn/tree/_partitioner.pyx
++++ b/sklearn/tree/_partitioner.pyx
+@@ -1,4 +1,4 @@
+-"""Partition samples in the construction of a tree.
++"""Part==ion samples in the construction of a tree.
+ 
+ This module contains the algorithms for moving sample indices to
+ the left and right child node given a split determined by the
+@@ -51,8 +51,59 @@ cdef class DensePartitioner:
+         self.end = end
+         self.n_missing = 0
+ 
++    cdef inline void sort_samples_and_feature_values_two_pixel(
++        self, intp_t current_feature1, intp_t current_feature2
++    ) noexcept nogil:
++        """Simultaneously sort based on the feature_values.
++
++        Missing values are stored at the end of feature_values.
++        The number of missing values observed in feature_values is stored
++        in self.n_missing.
++        """
++        cdef:
++            intp_t i, current_end
++            float32_t[::1] feature_values = self.feature_values
++            const float32_t[:, :] X = self.X
++            intp_t[::1] samples = self.samples
++            intp_t n_missing = 0
++            const uint8_t[::1] missing_values_in_feature_mask = self.missing_values_in_feature_mask
++
++        # Sort samples along that feature; by copying the values into an array and
++        # sorting the array in a manner which utilizes the cache more effectively.
++        if missing_values_in_feature_mask is not None and missing_values_in_feature_mask[current_feature1]:
++            i, current_end = self.start, self.end - 1
++            #here we do not care for missing value for feature 2 since we will not have missing values ... TODO
++            # Missing values are placed at the end and do not participate in the sorting.
++            while i <= current_end:
++                # Finds the right-most value that is not missing so that
++                # it can be swapped with missing values at its left.
++                if isnan(X[samples[current_end], current_feature1]):
++                    n_missing += 1
++                    current_end -= 1
++                    continue
++
++                # X[samples[current_end], current_feature] is a non-missing value
++                if isnan(X[samples[i], current_feature1]):
++                    samples[i], samples[current_end] = samples[current_end], samples[i]
++                    n_missing += 1
++                    current_end -= 1
++
++                feature_values[i] = X[samples[i], current_feature1] - X[samples[i], current_feature2]
++                i += 1
++        else:
++            # When there are no missing values, we only need to copy the data into
++            # feature_values
++            for i in range(self.start, self.end):
++                feature_values[i] = X[samples[i], current_feature1] - X[samples[i], current_feature2]
++
++        sort(&feature_values[self.start], &samples[self.start], self.end - self.start - n_missing)
++        self.n_missing = n_missing
++
++
++
++
+     cdef inline void sort_samples_and_feature_values(
+-        self, intp_t current_feature
++        self, intp_t current_feature 
+     ) noexcept nogil:
+         """Simultaneously sort based on the feature_values.
+ 
+@@ -93,7 +144,7 @@ cdef class DensePartitioner:
+             # When there are no missing values, we only need to copy the data into
+             # feature_values
+             for i in range(self.start, self.end):
+-                feature_values[i] = X[samples[i], current_feature]
++                feature_values[i] = X[samples[i], current_feature] 
+ 
+         sort(&feature_values[self.start], &samples[self.start], self.end - self.start - n_missing)
+         self.n_missing = n_missing
+diff --git a/sklearn/tree/_splitter.pxd b/sklearn/tree/_splitter.pxd
+index 42c6c6d..0e48fc6 100644
+--- a/sklearn/tree/_splitter.pxd
++++ b/sklearn/tree/_splitter.pxd
+@@ -13,6 +13,7 @@ from ._tree cimport ParentInfo
+ cdef struct SplitRecord:
+     # Data to track sample split
+     intp_t feature         # Which feature to split on.
++    intp_t feature2         # Second feature that might be needed in two pixel test.
+     intp_t pos             # Split samples array at the given position,
+     #                      # i.e. count of samples below threshold for feature.
+     #                      # pos is >= end if the node is a leaf.
+diff --git a/sklearn/tree/_splitter.pyx b/sklearn/tree/_splitter.pyx
+index b557a4d..c08f8a6 100644
+--- a/sklearn/tree/_splitter.pyx
++++ b/sklearn/tree/_splitter.pyx
+@@ -50,6 +50,7 @@ cdef inline void _init_split(SplitRecord* self, intp_t start_pos) noexcept nogil
+     self.impurity_right = INFINITY
+     self.pos = start_pos
+     self.feature = 0
++    self.feature2 = 0
+     self.threshold = 0.
+     self.improvement = -INFINITY
+     self.missing_go_to_left = False
+@@ -265,6 +266,298 @@ cdef class Splitter:
+ 
+         return self.criterion.node_impurity()
+ 
++cdef inline int node_split_two_pixels(
++    Splitter splitter,
++    DensePartitioner partitioner,
++    Criterion criterion,
++    SplitRecord* split,
++    ParentInfo* parent_record,
++) except -1 nogil:
++    """Find the best split on node samples[start:end]
++
++    Returns -1 in case of failure to allocate memory (and raise MemoryError)
++    or 0 otherwise.
++    """
++    cdef const int8_t[:] monotonic_cst = splitter.monotonic_cst
++    cdef bint with_monotonic_cst = splitter.with_monotonic_cst
++
++    # Find the best split
++    cdef intp_t start = splitter.start
++    cdef intp_t end = splitter.end
++    cdef intp_t end_non_missing
++    cdef intp_t n_missing = 0
++    cdef bint has_missing = 0
++    cdef intp_t n_searches
++    cdef intp_t n_left, n_right
++    cdef bint missing_go_to_left
++
++    cdef intp_t[::1] samples = splitter.samples
++    cdef intp_t[::1] features = splitter.features
++    cdef intp_t[::1] constant_features = splitter.constant_features
++    cdef intp_t n_features = splitter.n_features
++
++    cdef float32_t[::1] feature_values = splitter.feature_values
++    cdef intp_t max_features = splitter.max_features
++    cdef intp_t min_samples_leaf = splitter.min_samples_leaf
++    cdef float64_t min_weight_leaf = splitter.min_weight_leaf
++    cdef uint32_t* random_state = &splitter.rand_r_state
++
++    cdef SplitRecord best_split, current_split
++    cdef float64_t current_proxy_improvement = -INFINITY
++    cdef float64_t best_proxy_improvement = -INFINITY
++
++    cdef float64_t impurity = parent_record.impurity
++    cdef float64_t lower_bound = parent_record.lower_bound
++    cdef float64_t upper_bound = parent_record.upper_bound
++
++    cdef intp_t f_i = n_features
++    cdef intp_t f_j
++    cdef intp_t f_j2
++    cdef intp_t p
++    cdef intp_t p_prev
++
++    cdef intp_t n_visited_features = 0
++    # Number of features discovered to be constant during the split search
++    cdef intp_t n_found_constants = 0
++    # Number of features known to be constant and drawn without replacement
++    cdef intp_t n_drawn_constants = 0
++    cdef intp_t n_known_constants = parent_record.n_constant_features
++    # n_total_constants = n_known_constants + n_found_constants
++    cdef intp_t n_total_constants = n_known_constants
++
++    _init_split(&best_split, end)
++
++    partitioner.init_node_split(start, end)
++
++    # Sample up to max_features without replacement using a
++    # Fisher-Yates-based algorithm (using the local variables `f_i` and
++    # `f_j` to compute a permutation of the `features` array).
++    #
++    # Skip the CPU intensive evaluation of the impurity criterion for
++    # features that were already detected as constant (hence not suitable
++    # for good splitting) by ancestor nodes and save the information on
++    # newly discovered constant features to spare computation on descendant
++    # nodes.
++    while (f_i > n_total_constants and  # Stop early if remaining features
++                                        # are constant
++            (n_visited_features < max_features or
++             # At least one drawn features must be non constant
++             n_visited_features <= n_found_constants + n_drawn_constants)):
++
++        n_visited_features += 1
++
++        # Loop invariant: elements of features in
++        # - [:n_drawn_constant[ holds drawn and known constant features;
++        # - [n_drawn_constant:n_known_constant[ holds known constant
++        #   features that haven't been drawn yet;
++        # - [n_known_constant:n_total_constant[ holds newly found constant
++        #   features;
++        # - [n_total_constant:f_i[ holds features that haven't been drawn
++        #   yet and aren't constant apriori.
++        # - [f_i:n_features[ holds features that have been drawn
++        #   and aren't constant.
++
++        # Draw two features at random
++
++        f_j  = rand_int(n_drawn_constants, f_i - n_found_constants, random_state)
++        f_j2 = rand_int(n_drawn_constants, f_i - n_found_constants - 1, random_state)
++
++        # Shift f_j2 up if collision would occur
++        #if f_j2 == f_j:
++        #    f_j2 += 1
++
++        if f_j < n_known_constants:
++            # f_j in the interval [n_drawn_constants, n_known_constants[
++            features[n_drawn_constants], features[f_j] = features[f_j], features[n_drawn_constants]
++
++            n_drawn_constants += 1
++            continue
++
++        if f_j2 < n_known_constants:
++            # f_j in the interval [n_drawn_constants, n_known_constants[
++            features[n_drawn_constants], features[f_j2] = features[f_j2], features[n_drawn_constants]
++
++            n_drawn_constants += 1
++            continue
++
++
++        # f_j in the interval [n_known_constants, f_i - n_found_constants[
++        f_j += n_found_constants
++        f_j2 += n_found_constants
++        # f_j in the interval [n_total_constants, f_i[
++        current_split.feature = features[f_j] 
++        current_split.feature2 = features[f_j2]
++
++        partitioner.sort_samples_and_feature_values_two_pixel(current_split.feature, current_split.feature2)
++        n_missing = partitioner.n_missing
++        end_non_missing = end - n_missing
++
++        if (
++            # All values for this feature are missing, or
++            end_non_missing == start or
++            # This feature is considered constant (max - min <= FEATURE_THRESHOLD)
++            feature_values[end_non_missing - 1] <= feature_values[start] + FEATURE_THRESHOLD
++        ):
++            # We consider this feature constant in this case.
++            # Since finding a split among constant feature is not valuable,
++            # we do not consider this feature for splitting.
++            features[f_j], features[n_total_constants] = features[n_total_constants], features[f_j]
++
++            n_found_constants += 1
++            n_total_constants += 1
++            continue
++
++        f_i -= 1
++        features[f_i], features[f_j] = features[f_j], features[f_i]
++        has_missing = n_missing != 0
++        criterion.init_missing(n_missing)  # initialize even when n_missing == 0
++
++        # Evaluate all splits
++
++        # If there are missing values, then we search twice for the most optimal split.
++        # The first search will have all the missing values going to the right node.
++        # The second search will have all the missing values going to the left node.
++        # If there are no missing values, then we search only once for the most
++        # optimal split.
++        n_searches = 2 if has_missing else 1
++
++        for i in range(n_searches):
++            missing_go_to_left = i == 1
++            criterion.missing_go_to_left = missing_go_to_left
++            criterion.reset()
++
++            p = start
++
++            while p < end_non_missing:
++                partitioner.next_p(&p_prev, &p)
++
++                if p >= end_non_missing:
++                    continue
++
++                if missing_go_to_left:
++                    n_left = p - start + n_missing
++                    n_right = end_non_missing - p
++                else:
++                    n_left = p - start
++                    n_right = end_non_missing - p + n_missing
++
++                # Reject if min_samples_leaf is not guaranteed
++                if n_left < min_samples_leaf or n_right < min_samples_leaf:
++                    continue
++
++                current_split.pos = p
++                criterion.update(current_split.pos)
++
++                # Reject if monotonicity constraints are not satisfied
++                if (
++                    with_monotonic_cst and
++                    monotonic_cst[current_split.feature] != 0 and
++                    not criterion.check_monotonicity(
++                        monotonic_cst[current_split.feature],
++                        lower_bound,
++                        upper_bound,
++                    )
++                ):
++                    continue
++
++                # Reject if min_weight_leaf is not satisfied
++                if ((criterion.weighted_n_left < min_weight_leaf) or
++                        (criterion.weighted_n_right < min_weight_leaf)):
++                    continue
++
++                current_proxy_improvement = criterion.proxy_impurity_improvement()
++
++                if current_proxy_improvement > best_proxy_improvement:
++                    best_proxy_improvement = current_proxy_improvement
++                    # sum of halves is used to avoid infinite value
++                    current_split.threshold = (
++                        feature_values[p_prev] / 2.0 + feature_values[p] / 2.0
++                    )
++
++                    if (
++                        current_split.threshold == feature_values[p] or
++                        current_split.threshold == INFINITY or
++                        current_split.threshold == -INFINITY
++                    ):
++                        current_split.threshold = feature_values[p_prev]
++
++                    current_split.n_missing = n_missing
++
++                    # if there are no missing values in the training data, during
++                    # test time, we send missing values to the branch that contains
++                    # the most samples during training time.
++                    if n_missing == 0:
++                        current_split.missing_go_to_left = n_left > n_right
++                    else:
++                        current_split.missing_go_to_left = missing_go_to_left
++
++                    best_split = current_split  # copy
++
++        # Evaluate when there are missing values and all missing values goes
++        # to the right node and non-missing values goes to the left node.
++        if has_missing:
++            n_left, n_right = end - start - n_missing, n_missing
++            p = end - n_missing
++            missing_go_to_left = 0
++
++            if not (n_left < min_samples_leaf or n_right < min_samples_leaf):
++                criterion.missing_go_to_left = missing_go_to_left
++                criterion.update(p)
++
++                if not ((criterion.weighted_n_left < min_weight_leaf) or
++                        (criterion.weighted_n_right < min_weight_leaf)):
++                    current_proxy_improvement = criterion.proxy_impurity_improvement()
++
++                    if current_proxy_improvement > best_proxy_improvement:
++                        best_proxy_improvement = current_proxy_improvement
++                        current_split.threshold = INFINITY
++                        current_split.missing_go_to_left = missing_go_to_left
++                        current_split.n_missing = n_missing
++                        current_split.pos = p
++                        best_split = current_split
++
++    # Reorganize into samples[start:best_split.pos] + samples[best_split.pos:end]
++    if best_split.pos < end:
++        partitioner.partition_samples_final(
++            best_split.pos,
++            best_split.threshold,
++            best_split.feature,
++            best_split.n_missing
++        )
++        criterion.init_missing(best_split.n_missing)
++        criterion.missing_go_to_left = best_split.missing_go_to_left
++
++        criterion.reset()
++        criterion.update(best_split.pos)
++        criterion.children_impurity(
++            &best_split.impurity_left, &best_split.impurity_right
++        )
++        best_split.improvement = criterion.impurity_improvement(
++            impurity,
++            best_split.impurity_left,
++            best_split.impurity_right
++        )
++
++        shift_missing_values_to_left_if_required(&best_split, samples, end)
++
++    # Respect invariant for constant features: the original order of
++    # element in features[:n_known_constants] must be preserved for sibling
++    # and child nodes
++    memcpy(&features[0], &constant_features[0], sizeof(intp_t) * n_known_constants)
++
++    # Copy newly found constant features
++    memcpy(&constant_features[n_known_constants],
++           &features[n_known_constants],
++           sizeof(intp_t) * n_found_constants)
++
++    # Return values
++    parent_record.n_constant_features = n_total_constants
++    split[0] = best_split
++    return 0
++
++
++
++
+ 
+ cdef inline int node_split_best(
+     Splitter splitter,
+@@ -789,6 +1082,36 @@ cdef inline int node_split_random(
+     return 0
+ 
+ 
++cdef class TwoPixelSplitter(Splitter):
++    cdef DensePartitioner partitioner
++
++    cdef int init(
++        self,
++        object X,
++        const float64_t[:, ::1] y,
++        const float64_t[:] sample_weight,
++        const uint8_t[::1] missing_values_in_feature_mask,
++    ) except -1:
++        Splitter.init(self, X, y, sample_weight, missing_values_in_feature_mask)
++        self.partitioner = DensePartitioner(
++            X, self.samples, self.feature_values, missing_values_in_feature_mask
++        )
++
++    
++    cdef int node_split(
++            self,
++            ParentInfo* parent_record,
++            SplitRecord* split,
++    ) except -1 nogil:
++        return node_split_two_pixels(
++            self,
++            self.partitioner,
++            self.criterion,
++            split,
++            parent_record,
++        )
++
++
+ cdef class BestSplitter(Splitter):
+     """Splitter for finding the best split on dense data."""
+     cdef DensePartitioner partitioner
+@@ -899,3 +1222,5 @@ cdef class RandomSparseSplitter(Splitter):
+             split,
+             parent_record,
+         )
++
++
+diff --git a/sklearn/tree/_tree.pxd b/sklearn/tree/_tree.pxd
+index 2cadca4..ebde0df 100644
+--- a/sklearn/tree/_tree.pxd
++++ b/sklearn/tree/_tree.pxd
+@@ -17,6 +17,7 @@ cdef struct Node:
+     intp_t left_child                    # id of the left child of the node
+     intp_t right_child                   # id of the right child of the node
+     intp_t feature                       # Feature used for splitting the node
++    intp_t feature2                       # 2nd Feature used for splitting the node if two pixel
+     float64_t threshold                  # Threshold value at the node
+     float64_t impurity                   # Impurity of the node (i.e., the value of the criterion)
+     intp_t n_node_samples                # Number of samples at the node
+@@ -53,9 +54,11 @@ cdef class Tree:
+     cdef float64_t* value                # (capacity, n_outputs, max_n_classes) array of values
+     cdef intp_t value_stride             # = n_outputs * max_n_classes
+ 
++    cdef public bint two_pixel         # Tells wheter the tree uses axis aligned vs two pixel test
++
+     # Methods
+     cdef intp_t _add_node(self, intp_t parent, bint is_left, bint is_leaf,
+-                          intp_t feature, float64_t threshold, float64_t impurity,
++                          intp_t feature,intp_t feature2, float64_t threshold, float64_t impurity,
+                           intp_t n_node_samples,
+                           float64_t weighted_n_node_samples,
+                           uint8_t missing_go_to_left) except -1 nogil
+@@ -97,6 +100,7 @@ cdef class TreeBuilder:
+     cdef intp_t min_samples_leaf        # Minimum number of samples in a leaf
+     cdef float64_t min_weight_leaf         # Minimum weight in a leaf
+     cdef intp_t max_depth               # Maximal tree depth
++    cdef bint two_pixel                 #wheter the tree will use the two pixel test or axis aligned
+     cdef float64_t min_impurity_decrease   # Impurity threshold for early stopping
+ 
+     cpdef build(
+diff --git a/sklearn/tree/_tree.pyx b/sklearn/tree/_tree.pyx
+index 9d0b285..be6fe06 100644
+--- a/sklearn/tree/_tree.pyx
++++ b/sklearn/tree/_tree.pyx
+@@ -130,7 +130,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
+ 
+     def __cinit__(self, Splitter splitter, intp_t min_samples_split,
+                   intp_t min_samples_leaf, float64_t min_weight_leaf,
+-                  intp_t max_depth, float64_t min_impurity_decrease):
++                  intp_t max_depth, float64_t min_impurity_decrease, bint two_pixel=False):
+         self.splitter = splitter
+         self.min_samples_split = min_samples_split
+         self.min_samples_leaf = min_samples_leaf
+@@ -138,6 +138,8 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
+         self.max_depth = max_depth
+         self.min_impurity_decrease = min_impurity_decrease
+ 
++        self.two_pixel = two_pixel
++
+     cpdef build(
+         self,
+         Tree tree,
+@@ -253,7 +255,7 @@ cdef class DepthFirstTreeBuilder(TreeBuilder):
+                                (split.improvement + EPSILON <
+                                 min_impurity_decrease))
+ 
+-                node_id = tree._add_node(parent, is_left, is_leaf, split.feature,
++                node_id = tree._add_node(parent, is_left, is_leaf, split.feature, split.feature2,
+                                          split.threshold, parent_record.impurity,
+                                          n_node_samples, weighted_n_node_samples,
+                                          split.missing_go_to_left)
+@@ -384,7 +386,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
+     def __cinit__(self, Splitter splitter, intp_t min_samples_split,
+                   intp_t min_samples_leaf,  min_weight_leaf,
+                   intp_t max_depth, intp_t max_leaf_nodes,
+-                  float64_t min_impurity_decrease):
++                  float64_t min_impurity_decrease, bint two_pixel=False):
+         self.splitter = splitter
+         self.min_samples_split = min_samples_split
+         self.min_samples_leaf = min_samples_leaf
+@@ -393,6 +395,8 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
+         self.max_leaf_nodes = max_leaf_nodes
+         self.min_impurity_decrease = min_impurity_decrease
+ 
++        self.two_pixel = two_pixel
++
+     cpdef build(
+         self,
+         Tree tree,
+@@ -612,7 +616,7 @@ cdef class BestFirstTreeBuilder(TreeBuilder):
+                                  if parent != NULL
+                                  else _TREE_UNDEFINED,
+                                  is_left, is_leaf,
+-                                 split.feature, split.threshold, parent_record.impurity,
++                                 split.feature, split.feature2,  split.threshold, parent_record.impurity,
+                                  n_node_samples, weighted_n_node_samples,
+                                  split.missing_go_to_left)
+         if node_id == INTPTR_MAX:
+@@ -768,7 +772,7 @@ cdef class Tree:
+ 
+     # TODO: Convert n_classes to cython.integral memory view once
+     #  https://github.com/cython/cython/issues/5243 is fixed
+-    def __cinit__(self, intp_t n_features, cnp.ndarray n_classes, intp_t n_outputs):
++    def __cinit__(self, intp_t n_features, cnp.ndarray n_classes, intp_t n_outputs, bint two_pixel=False):
+         """Constructor."""
+         cdef intp_t dummy = 0
+         size_t_dtype = np.array(dummy).dtype
+@@ -795,6 +799,9 @@ cdef class Tree:
+         self.value = NULL
+         self.nodes = NULL
+ 
++        #Two Pixel 
++        self.two_pixel = two_pixel
++
+     def __dealloc__(self):
+         """Destructor."""
+         # Free all inner structures
+@@ -895,7 +902,7 @@ cdef class Tree:
+         return 0
+ 
+     cdef intp_t _add_node(self, intp_t parent, bint is_left, bint is_leaf,
+-                          intp_t feature, float64_t threshold, float64_t impurity,
++                          intp_t feature, intp_t feature2, float64_t threshold, float64_t impurity,
+                           intp_t n_node_samples,
+                           float64_t weighted_n_node_samples,
+                           uint8_t missing_go_to_left) except -1 nogil:
+@@ -926,11 +933,13 @@ cdef class Tree:
+             node.left_child = _TREE_LEAF
+             node.right_child = _TREE_LEAF
+             node.feature = _TREE_UNDEFINED
++            node.feature2 = _TREE_UNDEFINED
+             node.threshold = _TREE_UNDEFINED
+ 
+         else:
+             # left_child and right_child will be set later
+             node.feature = feature
++            node.feature2 = feature2
+             node.threshold = threshold
+             node.missing_go_to_left = missing_go_to_left
+ 
+@@ -967,7 +976,10 @@ cdef class Tree:
+         # Extract input
+         cdef const float32_t[:, :] X_ndarray = X
+         cdef intp_t n_samples = X.shape[0]
+-        cdef float32_t X_i_node_feature
++        cdef float32_t X_i_node_feature 
++        cdef float32_t X_i_node_feature2
++        cdef bint twoPixel = self.twoPixel
++
+ 
+         # Initialize output
+         cdef intp_t[:] out = np.zeros(n_samples, dtype=np.intp)
+@@ -982,16 +994,23 @@ cdef class Tree:
+                 # While node not a leaf
+                 while node.left_child != _TREE_LEAF:
+                     X_i_node_feature = X_ndarray[i, node.feature]
++                    X_i_node_feature2 = 0 if not twoPixel else X_ndarray[i, node.feature2]
+                     # ... and node.right_child != _TREE_LEAF:
+                     if isnan(X_i_node_feature):
+                         if node.missing_go_to_left:
+                             node = &self.nodes[node.left_child]
+                         else:
+                             node = &self.nodes[node.right_child]
+-                    elif X_i_node_feature <= node.threshold:
+-                        node = &self.nodes[node.left_child]
++                    elif (twoPixel):
++                        if X_i_node_feature - X_i_node_feature2 <= node.threshold:
++                            node = &self.nodes[node.left_child]
++                        else:
++                            node = &self.nodes[node.right_child]
+                     else:
+-                        node = &self.nodes[node.right_child]
++                        if X_i_node_feature <= node.threshold:
++                            node = &self.nodes[node.left_child]
++                        else:
++                            node = &self.nodes[node.right_child]
+ 
+                 out[i] = <intp_t>(node - self.nodes)  # node offset
+ 
+@@ -1929,7 +1948,7 @@ cdef void _build_pruned_tree(
+                 break
+ 
+             new_node_id = tree._add_node(
+-                parent, is_left, is_leaf, node.feature, node.threshold,
++                parent, is_left, is_leaf, node.feature,node.feature2, node.threshold,
+                 node.impurity, node.n_node_samples,
+                 node.weighted_n_node_samples, node.missing_go_to_left)
+ 
+-- 
+2.51.2
+
