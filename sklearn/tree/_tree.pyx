@@ -978,7 +978,7 @@ cdef class Tree:
         cdef intp_t n_samples = X.shape[0]
         cdef float32_t X_i_node_feature 
         cdef float32_t X_i_node_feature2
-        cdef bint twoPixel = self.twoPixel
+        cdef bint twoPixel = self.two_pixel
 
 
         # Initialize output

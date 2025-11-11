@@ -1506,7 +1506,7 @@ class RandomForestClassifier(ForestClassifier):
             None,
         ],
     }
-    _parameter_constraints.pop("splitter")
+    #_parameter_constraints.pop("splitter")
 
     def __init__(
         self,
@@ -1530,6 +1530,7 @@ class RandomForestClassifier(ForestClassifier):
         ccp_alpha=0.0,
         max_samples=None,
         monotonic_cst=None,
+        splitter='best'
     ):
         super().__init__(
             estimator=DecisionTreeClassifier(),
@@ -1546,6 +1547,7 @@ class RandomForestClassifier(ForestClassifier):
                 "random_state",
                 "ccp_alpha",
                 "monotonic_cst",
+                "splitter"
             ),
             bootstrap=bootstrap,
             oob_score=oob_score,
@@ -1567,6 +1569,7 @@ class RandomForestClassifier(ForestClassifier):
         self.min_impurity_decrease = min_impurity_decrease
         self.monotonic_cst = monotonic_cst
         self.ccp_alpha = ccp_alpha
+        self.splitter = splitter
 
 
 class RandomForestRegressor(ForestRegressor):
